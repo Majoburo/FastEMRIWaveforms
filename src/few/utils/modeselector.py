@@ -6,7 +6,7 @@ import sys
 import numpy as np
 
 from .baseclasses import BackendLike, ParallelModuleBase
-from .constants import MTSUN_SI, PI
+from .constants import MTSUN_SI, PI, Gpc, MRSUN_SI
 from .geodesic import get_fundamental_frequencies
 from .globals import get_logger
 
@@ -70,7 +70,282 @@ def SPAFunc(x, th=7.0):
     return ans
 # fmt: on
 
+class SNRModeSelector(ParallelModuleBase):
+    r"""Filter teukolsky amplitudes based on power contribution.
 
+    This module takes teukolsky modes, combines them with their associated ylms,
+    and determines the power contribution from each mode. It then filters the
+    modes bases on the fractional accuracy on the total power (eps) parameter.
+    Additionally, if a sensitivity curve is provided, the mode power is also
+    weighted according to the PSD of the sensitivity.
+
+    The mode filtering is a major contributing factor to the speed of these
+    waveforms as it removes large numbers of useles modes from the final
+    summation calculation.
+
+    Be careful as this is built based on the construction that input mode arrays
+    will in order of :math:`m=0`, :math:`m>0`, and then :math:`m<0`.
+
+    args:
+        l_arr: The l-mode indices for each mode index.
+        m_arr: The m-mode indices for each mode index. Requires all :math:`m \geq 0`.
+        k_arr: The k-mode indices for each mode index.
+        n_arr: The n-mode indices for each mode index.
+        mode_selection: Determines the type of mode
+            filtering to perform. If None, use default mode filtering provided
+            by :code:`mode_selector`. If 'all', it will run all modes without
+            filtering. If 'threshold' it will override other options to filter by the
+            threshold value set by :code:`mode_selection_threshold`. If a list of tuples (or lists) of
+            mode indices (e.g. [(:math:`l_1,m_1,k_1,n_1`), (:math:`l_2,m_2,k_2,n_2`)]) is
+            provided, it will return those modes combined into a
+            single waveform.
+            Default is None.
+        include_minus_mkn: If True, then include :math:`(-m, -k, -n)` mode when
+            computing a :math:`(m, k, n)` mode. This only affects modes if :code:`mode_selection`
+            is a list of specific modes when the class is called. If True, this list of modes
+            provided at call time must only contain :math:`m\geq 0`. Default is True.
+        mode_selection_threshold: Fractional accuracy of the total power used
+            to determine the contributing modes. Lowering this value will
+            calculate more modes slower the waveform down, but generally
+            improving accuracy. Increasing this value removes modes from
+            consideration and can have a considerable affect on the speed of
+            the waveform, albeit at the cost of some accuracy (usually an
+            acceptable loss). Default that gives good mismatch qualities is
+            1e-5.
+        sensitivity_fn: Sensitivity curve function that takes
+            a frequency (Hz) array as input and returns the Power Spectral Density (PSD)
+            of the sensitivity curve. Default is None. If this is not none, this
+            sennsitivity is used to weight the mode values when determining which
+            modes to keep. **Note**: if the sensitivity function is provided,
+            and GPUs are used, then this function must accept CuPy arrays as input.
+        **kwargs: Optional keyword arguments for the base class:
+            :class:`few.utils.baseclasses.ParallelModuleBase`.
+
+    """
+
+    def __init__(
+        self,
+        l_arr: np.ndarray,
+        m_arr: np.ndarray,
+        k_arr: np.ndarray,
+        n_arr: np.ndarray,
+        include_minus_mkn: Optional[bool] = True,
+        dt: Optional[float] = None,
+        dist: Optional[float] = None,
+        sensitivity_fn: Optional[object] = None,
+        force_backend: BackendLike = None,
+        **kwargs,
+    ):
+        ParallelModuleBase.__init__(self, force_backend=force_backend, **kwargs)
+
+        assert self.xp.all(m_arr >= 0), "ModeSelector only supports m >= 0."
+
+        # store information releated to m values
+        # the order is m = 0, m > 0, m < 0
+        m0mask = m_arr != 0
+        self.m0mask = m0mask
+        """array: Mask for m=0 modes."""
+        self.num_m_zero_up = len(m0mask)
+        r"""int: Number of modes with :math:`m\geq0`."""
+        self.num_m_1_up = len(self.xp.arange(len(m0mask))[m0mask])
+        r"""int: Number of modes with :math:`m\geq1`."""
+        self.num_m0 = len(self.xp.arange(len(m0mask))[~m0mask])
+        """int: Number of modes with :math:`m=0`."""
+
+        self.l_arr = l_arr
+        """array: l-mode indices for each mode index."""
+        self.m_arr = m_arr
+        """array: m-mode indices for each mode index."""
+        self.k_arr = k_arr
+        """array: k-mode indices for each mode index."""
+        self.n_arr = n_arr
+        """array: n-mode indices for each mode index."""
+
+        self.sensitivity_fn = sensitivity_fn
+        """object: sensitivity generating function for power-weighting."""
+
+        self.include_minus_mkn = include_minus_mkn
+        """bool: Whether to include modes with m < 0 in the output."""
+        """Note that the module always outputs m>=0 Teukolsky amplitudes, but +m and -m Ylms.
+        Instead m<0 Teukolsky amplitudes are included in the mode sum via mode symmetry.
+        Therefore, to include m<0 Teukolsky amplitudes in the waveform
+        but NOT m>0, we set the m>0 Ylm to zero."""
+
+        self.dt = dt
+        self.dist = dist
+        self.negative_m_flag = False  # flag to check if m < 0 modes are included
+        """bool: Specifies whether there are negative m-modes in mode_selection."""
+
+
+    @classmethod
+    def supported_backends(cls):
+        return cls.GPU_RECOMMENDED()
+
+    @property
+    def is_predictive(self):
+        """Whether this mode selector should be used before or after amplitude generation"""
+        return False
+
+    def __call__(
+        self,
+        teuk_modes: np.ndarray,
+        ylms: np.ndarray,
+        modeinds: list[np.ndarray],
+        fund_freq_args: Optional[tuple] = None,
+        include_minus_mkn: Optional[bool] = None,
+        dt: Optional[float] = None,
+        dist: Optional[float] = None,
+        snr_abs_threshold: Optional[float] = None,
+        return_mode_snr: Optional[bool] = False,
+    ) -> np.ndarray:
+        r"""Call to sort and filer teukolsky modes.
+
+        This is the call function that takes the teukolsky modes, ylms,
+        mode indices and fractional accuracy of the total power and returns
+        filtered teukolsky modes and ylms.
+
+        args:
+            teuk_modes: Complex teukolsky amplitudes
+                from the amplitude modules.
+                Shape: (number of trajectory points, number of modes).
+            ylms: Array of ylm values for each mode,
+                including m<0. Shape is (num of m==0,) + (num of m>0,)
+                + (num of m<0). Number of m<0 and m>0 is the same, but they are
+                ordered as (m==0) first then m>0 then m<0.
+            modeinds: List containing the mode index :math:`(l,m,k,n)` arrays,
+                e.g. [l_arr, m_arr, k_arr, n_arr].
+            fund_freq_args: Args necessary to determine
+                fundamental frequencies along trajectory. The tuple will represent
+                :math:`(m1, m2, a, p, e, \cos\iota)` where the primary mass (:math:`m_1`),
+                secondary mass (:math:`m_2`), and dimensionless spin (:math:`a`),
+                are scalar and the other three quantities are self.xp.ndarrays.
+                This must be provided if sensitivity weighting is used. Default is None.
+            include_minus_mkn: If True, then include :math:`(-m, -k, -n)` mode when
+                computing a :math:`(m, k, n)` mode. This only affects modes if :code:`mode_selection`
+                is a list of specific modes. Default is True.
+            snr_abs_threshold: If provided, bypasses fractional cumulative power filtering
+                and instead keeps modes whose (approximate) per-mode SNR exceeds this absolute
+                threshold. The per-mode SNR is computed as sqrt(sum_t |h_mode(t)|^2 / PSD(f_mode(t))).
+                Note: this is an adiabatic approximation consistent with the existing weighting,
+                and is accurate up to an overall constant factor that is common to all modes.
+            return_mode_snr: If True, append final return values that include the per‑mode SNR array
+                **and** the corresponding base mode indices for each SNR entry:
+                `(mode_snr, l_base, m_base, k_base, n_base)`, where each array has length equal to
+                the number of base modes (m≥0). Default False.
+
+        """
+        if include_minus_mkn is None:
+            include_minus_mkn = self.include_minus_mkn
+        if dt is None:
+            dt = self.dt
+        if dist is None:
+            dist = self.dist
+
+
+        # get the power contribution of each mode including m < 0
+        # if self.sensitivity_fn is None:
+        power = (
+            self.xp.abs(
+                self.xp.concatenate(
+                    [teuk_modes, self.xp.conj(teuk_modes[:, self.m0mask])], axis=1
+                )
+                * ylms
+            )
+            ** 2
+        )
+
+        # if noise weighting
+        if self.sensitivity_fn is not None:
+            if fund_freq_args is None:
+                raise ValueError(
+                    "If sensitivity weighting is desired, the fund_freq_args kwarg must be provided."
+                )
+
+            m1, m2 = fund_freq_args[0:2]
+            M = m1 + m2
+            Msec = M * MTSUN_SI
+
+            a_fr, p_fr, e_fr, x_fr = fund_freq_args[2:-1]
+
+            if (
+                self.backend.uses_cupy
+            ):  # fundamental frequencies only defined on CPU
+                p_fr = p_fr.get()
+                e_fr = e_fr.get()
+                x_fr = x_fr.get()
+
+            # get dimensionless fundamental frequency
+            OmegaPhi, OmegaTheta, OmegaR = get_fundamental_frequencies(
+                a_fr, p_fr, e_fr, x_fr
+            )
+            # NOTE: These frequencies may differ from waveform frequencies at 1PA order
+
+            # get frequencies in Hz
+            f_Phi, f_omega, f_r = OmegaPhi, OmegaTheta, OmegaR = (
+                self.xp.asarray(OmegaPhi) / (Msec * 2 * PI),
+                self.xp.asarray(OmegaTheta) / (Msec * 2 * PI),
+                self.xp.asarray(OmegaR) / (Msec * 2 * PI),
+            )
+
+            freqs = (
+                modeinds[1][self.xp.newaxis, :] * f_Phi[:, self.xp.newaxis]
+                + modeinds[2][self.xp.newaxis, :] * f_omega[:, self.xp.newaxis]
+                + modeinds[3][self.xp.newaxis, :] * f_r[:, self.xp.newaxis]
+            )
+
+            freqs_shape = freqs.shape
+
+            # make all frequencies positive
+            freqs_in = self.xp.abs(freqs)
+            PSD = self.sensitivity_fn(freqs_in.flatten()).reshape(freqs_shape)
+
+            power /= PSD
+
+            # --- Per-mode approximate SNR (adiabatic) ---
+            # power has shape (n_time, n_combined_modes) where combined duplicates +/-m.
+            # First sum over time to get per-(combined)-mode SNR^2; then fold -m onto +m
+            # and take sqrt to obtain an (approximate) per-mode SNR for base (m>=0) modes.
+            snr2_combined = power.sum(axis=0)
+            mu = m1 * m2 / (m1 + m2)
+            dist_dimensionless = (dist * Gpc) / (mu * MRSUN_SI)
+            # Vectorised fold of (-m) block onto (+m) block
+            # Base block: indices [0 : num_m_zero_up), with mask 'm0mask' indicating m>0
+            # Conjugate block: indices [num_m_zero_up : num_m_zero_up + num_m_1_up)
+            snr2_base = snr2_combined[: self.num_m_zero_up].copy()
+            snr2_base[self.m0mask] += snr2_combined[self.num_m_zero_up : self.num_m_zero_up + self.num_m_1_up]
+            mode_snr = self.xp.sqrt(snr2_base)/dist_dimensionless*dt*4
+
+            # Base-mode indices (m>=0) corresponding one-to-one with mode_snr entries
+            base_count = teuk_modes.shape[1]
+            l_base = modeinds[0][: base_count]
+            m_base = modeinds[1][: base_count]
+            k_base = modeinds[2][: base_count]
+            n_base = modeinds[3][: base_count]
+
+            # Expose mapping for downstream consumers
+            self.mode_snr = mode_snr
+            self.mode_snr_modes = (l_base, m_base, k_base, n_base)
+
+            # Select modes by absolute per-mode SNR threshold                
+            keep_modes = self.xp.where(mode_snr >= snr_abs_threshold)[0]
+
+            # Build Ylm selection that duplicates m=0 and shifts m>0 block as in the 'all' path
+            temp2 = keep_modes * (keep_modes < self.num_m0) + (
+                keep_modes + self.num_m_1_up
+            ) * (keep_modes >= self.num_m0)
+            ylmkeep = self.xp.concatenate([keep_modes, temp2])
+            ylms_out = ylms[ylmkeep]
+            teuk_modes_out = teuk_modes
+
+            # Prepare outputs analogous to the 'all' path
+            out1 = (teuk_modes_out[:, keep_modes], ylms_out)
+            out2 = tuple([arr[keep_modes] for arr in modeinds])
+
+            if return_mode_snr:
+                return out1 + out2 + (mode_snr, l_base, m_base, k_base, n_base)
+            else:
+                return out1 + out2
+    
 class ModeSelector(ParallelModuleBase):
     r"""Filter teukolsky amplitudes based on power contribution.
 
@@ -133,6 +408,8 @@ class ModeSelector(ParallelModuleBase):
         mode_selection: Optional[Union[str, list, np.ndarray]] = None,
         include_minus_mkn: Optional[bool] = True,
         mode_selection_threshold: float = 1e-5,
+        dt: Optional[float] = None,
+        dist: Optional[float] = None,
         sensitivity_fn: Optional[object] = None,
         force_backend: BackendLike = None,
         **kwargs,
@@ -173,6 +450,8 @@ class ModeSelector(ParallelModuleBase):
         but NOT m>0, we set the m>0 Ylm to zero."""
 
         self.mode_selection = mode_selection
+        self.dt = dt
+        self.dist = dist
         self.negative_m_flag = False  # flag to check if m < 0 modes are included
         """bool: Specifies whether there are negative m-modes in mode_selection."""
 
@@ -234,6 +513,9 @@ class ModeSelector(ParallelModuleBase):
         modeinds_map: Optional[np.ndarray] = None,
         include_minus_mkn: Optional[bool] = None,
         mode_selection_threshold: float = None,
+        dt: Optional[float] = None,
+        dist: Optional[float] = None,
+        snr_abs_threshold: Optional[float] = None,
     ) -> np.ndarray:
         r"""Call to sort and filer teukolsky modes.
 
@@ -279,10 +561,19 @@ class ModeSelector(ParallelModuleBase):
                 the waveform, albeit at the cost of some accuracy (usually an
                 acceptable loss). Default that gives good mismatch qualities is
                 1e-5.
+            snr_abs_threshold: If provided, bypasses fractional cumulative power filtering
+                and instead keeps modes whose (approximate) per-mode SNR exceeds this absolute
+                threshold. The per-mode SNR is computed as sqrt(sum_t |h_mode(t)|^2 / PSD(f_mode(t))).
+                Note: this is an adiabatic approximation consistent with the existing weighting,
+                and is accurate up to an overall constant factor that is common to all modes.
 
         """
         if include_minus_mkn is None:
             include_minus_mkn = self.include_minus_mkn
+        if dt is None:
+            dt = self.dt
+        if dist is None:
+            dist = self.dist
 
         # If mode_selection is None, default to values specified at instantiation
         if mode_selection is None:
@@ -429,6 +720,40 @@ class ModeSelector(ParallelModuleBase):
                 PSD = self.sensitivity_fn(freqs_in.flatten()).reshape(freqs_shape)
 
                 power /= PSD
+
+            if snr_abs_threshold is not None:
+                # --- Per-mode approximate SNR (adiabatic) ---
+                # power has shape (n_time, n_combined_modes) where combined duplicates +/-m.
+                # First sum over time to get per-(combined)-mode SNR^2; then fold -m onto +m
+                # and take sqrt to obtain an (approximate) per-mode SNR for base (m>=0) modes.
+                snr2_combined = power.sum(axis=0)
+                mu = m1 * m2 / (m1 + m2)
+                dist_dimensionless = (dist * Gpc) / (mu * MRSUN_SI)
+                # Vectorised fold of (-m) block onto (+m) block
+                # Base block: indices [0 : num_m_zero_up), with mask 'm0mask' indicating m>0
+                # Conjugate block: indices [num_m_zero_up : num_m_zero_up + num_m_1_up)
+                snr2_base = snr2_combined[: self.num_m_zero_up].copy()
+                snr2_base[self.m0mask] += snr2_combined[self.num_m_zero_up : self.num_m_zero_up + self.num_m_1_up]
+                mode_snr = self.xp.sqrt(snr2_base)/dist_dimensionless*dt*4
+
+
+                keep_modes = self.xp.where(mode_snr >= snr_abs_threshold)[0]
+
+                temp2 = keep_modes * (keep_modes < self.num_m0) + (
+                    keep_modes + self.num_m_1_up
+                ) * (keep_modes >= self.num_m0)
+
+                ylmkeep = self.xp.concatenate([keep_modes, temp2])
+                ylms_out = ylms[ylmkeep]
+                teuk_modes_out = teuk_modes[:, keep_modes]
+                return (
+                    teuk_modes_out,
+                    ylms_out,
+                    modeinds[0][keep_modes],
+                    modeinds[1][keep_modes],
+                    modeinds[2][keep_modes],
+                    modeinds[3][keep_modes],
+                )
 
             # sort the power for a cumulative summation
             inds_sort = self.xp.argsort(power, axis=1)[:, ::-1]
