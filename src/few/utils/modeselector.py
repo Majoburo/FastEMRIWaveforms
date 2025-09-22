@@ -264,7 +264,7 @@ class ModeSelector(ParallelModuleBase):
         include_minus_mkn: Optional[bool] = None,
         mode_selection_threshold: float = None,
         return_sort_inds: bool = False,
-        snr_abs_thr: Optioal[float] = None
+        snr_abs_thr: Optional[float] = None
     ) -> tuple[np.ndarray]:
         r"""Call to sort and filer teukolsky modes.
 
