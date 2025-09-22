@@ -318,6 +318,7 @@ class SphericalHarmonicWaveformBase(
                 mode_selection=mode_selection,
                 include_minus_mkn=include_minus_mkn,
                 mode_selection_threshold=mode_selection_threshold,
+                snr_abs_threshold=kwargs['snr_abs_threshold'],
             )
             # store number of modes for external information
             self.num_modes_kept = teuk_modes_in.shape[1]
