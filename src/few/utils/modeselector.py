@@ -426,7 +426,9 @@ class ModeSelector(ParallelModuleBase):
 
             if snr_abs_thr is not None:
                 # keep modes that add add above the threshold SNR
-                inds_keep = mode_snr2_ests >= snr_abs_thr**2
+                biggap = self.xp.sqrt(mode_snr2_ests[0]/mode_snr2_ests[1]) > snr_abs_thr
+                inds_keep = self.xp.zeros(len(mode_snr2_ests)) != 0
+                inds_keep[0] = biggap
             else:
                 # keep modes that add to within the fractional square SNR (1 - kappa)^2
                 inds_keep[1:] = cumsum[:-1] < cumsum[-1] * (
