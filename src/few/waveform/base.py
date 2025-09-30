@@ -307,6 +307,7 @@ class SphericalHarmonicWaveformBase(
                 self.ms,
                 self.ks,
                 self.ns,
+                self.snr_ratio
             ) = self.mode_selector(
                 t_temp,
                 a,

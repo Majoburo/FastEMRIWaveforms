@@ -426,7 +426,8 @@ class ModeSelector(ParallelModuleBase):
 
             if snr_abs_thr is not None:
                 # keep modes that add add above the threshold SNR
-                biggap = self.xp.sqrt(mode_snr2_ests[0]/mode_snr2_ests[1]) > snr_abs_thr
+                snr_ratio = self.xp.sqrt(mode_snr2_ests[0]/mode_snr2_ests[1])
+                biggap = snr_ratio > snr_abs_thr
                 inds_keep = self.xp.zeros(len(mode_snr2_ests)) != 0
                 inds_keep[0] = biggap
             else:
@@ -497,7 +498,10 @@ class ModeSelector(ParallelModuleBase):
         
             if return_sort_inds:
                 out_tuple += (inv_inds,)
-
+                
+            if snr_abs_thr is not None:
+                out_tuple += (snr_ratio,)
+        
         return out_tuple
 
 def get_selected_modes_from_initial_conditions(
