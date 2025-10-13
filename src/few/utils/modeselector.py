@@ -500,7 +500,7 @@ class ModeSelector(ParallelModuleBase):
                 out_tuple += (inv_inds,)
                 
             if snr_abs_thr is not None:
-                out_tuple += (snr_ratio,)
+                out_tuple += (mode_snr2_ests[0], snr_ratio,)
         
         return out_tuple
 
