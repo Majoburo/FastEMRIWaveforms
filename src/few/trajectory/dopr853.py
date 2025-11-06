@@ -1,17 +1,12 @@
 import numpy as np
 
-# try:
-#     import cupy as xp
-#     from .pydopr853 import dormandPrinceSteps as dormandPrinceSteps_gpu
-#     from .pydopr853 import error as error_gpu
-#     from .pydopr853 import controllerSuccess as controllerSuccess_gpu
-#     gpu_available = True
-#     from cupy.cuda.runtime import setDevice
-#     #setDevice(4)
-
-# except ModuleNotFoundError:
-#     import numpy as xp
-#     gpu_available = False
+# Try to import CuPy for GPU support
+try:
+    import cupy as xp
+    GPU_AVAILABLE = True
+except (ImportError, ModuleNotFoundError):
+    xp = np
+    GPU_AVAILABLE = False
 
 """from .pydopr853_cpu import dormandPrinceSteps as dormandPrinceSteps_cpu
 from .pydopr853_cpu import error as error_cpu
@@ -803,24 +798,39 @@ class DOPR853:
     def eval(self, t_new: np.ndarray, t_old: np.ndarray, spline_coeffs: np.ndarray):
         assert not self.fix_step
 
+        # Automatically detect array module from input arrays
+        # Check ALL THREE inputs and prefer GPU if any is on GPU
+        if GPU_AVAILABLE:
+            import cupy
+            xp_t_old = cupy.get_array_module(t_old)
+            xp_t_new = cupy.get_array_module(t_new)
+            xp_coeffs = cupy.get_array_module(spline_coeffs)
+            # Prefer GPU: use CuPy if ANY input is CuPy
+            xp_local = cupy if (xp_t_old is cupy or xp_t_new is cupy or xp_coeffs is cupy) else np
+        else:
+            xp_local = np
+
+        # Convert ALL inputs to the selected backend
+        # This will transfer NumPy→GPU if needed, or stay on GPU if already there
+        t_old = xp_local.asarray(t_old)
+        t_new = xp_local.asarray(t_new)
+        spline_coeffs = xp_local.asarray(spline_coeffs)
+
         t_min = t_old.min()
         t_max = t_old.max()
 
-        if not np.all((t_min <= t_new) & (t_new <= t_max)):
+        if not xp_local.all((t_min <= t_new) & (t_new <= t_max)):
             raise ValueError(
                 f"All t_new values must be between t_min ({t_min}) and t_max ({t_max})."
             )
 
-        # Ensure arrays are proper ndarrays for CuPy compatibility
-        t_old_arr = np.asarray(t_old)
-        t_new_arr = np.asarray(t_new)
-        segments = np.searchsorted(t_old_arr, t_new_arr, side="right") - 1
+        segments = xp_local.searchsorted(t_old, t_new, side="right") - 1
         segments[t_new == t_max] = t_old.shape[0] - 2  # there is 1 less spline segment
 
         # NOT MEMORY EFFICIENT
         tmp_coeffs = spline_coeffs[segments]
         tmp_t_old = t_old[segments]
-        diffs = np.diff(t_old)[segments]
+        diffs = xp_local.diff(t_old)[segments]
 
         assert spline_coeffs.ndim == 3 and spline_coeffs.shape[-1] == 8
 
@@ -833,7 +843,7 @@ class DOPR853:
         rcont7 = tmp_coeffs[:, :, 6]
         rcont8 = tmp_coeffs[:, :, 7]
 
-        s = ((t_new_arr - tmp_t_old) / diffs)[:, None]  # add axes to match rcont shape
+        s = ((t_new - tmp_t_old) / diffs)[:, None]  # add axes to match rcont shape
         s1 = 1.0 - s
 
         output = rcont1 + s * (
@@ -856,22 +866,37 @@ class DOPR853:
         spline_coeffs: np.ndarray,
         order: int = 1,
     ):
+        # Automatically detect array module from input arrays
+        # Check ALL THREE inputs and prefer GPU if any is on GPU
+        if GPU_AVAILABLE:
+            import cupy
+            xp_t_old = cupy.get_array_module(t_old)
+            xp_t_new = cupy.get_array_module(t_new)
+            xp_coeffs = cupy.get_array_module(spline_coeffs)
+            # Prefer GPU: use CuPy if ANY input is CuPy
+            xp_local = cupy if (xp_t_old is cupy or xp_t_new is cupy or xp_coeffs is cupy) else np
+        else:
+            xp_local = np
+
+        # Convert ALL inputs to the selected backend
+        # This will transfer NumPy→GPU if needed, or stay on GPU if already there
+        t_old = xp_local.asarray(t_old)
+        t_new = xp_local.asarray(t_new)
+        spline_coeffs = xp_local.asarray(spline_coeffs)
+
         t_min = t_old.min()
         t_max = t_old.max()
-        if not np.all((t_min <= t_new) & (t_new <= t_max)):
+        if not xp_local.all((t_min <= t_new) & (t_new <= t_max)):
             raise ValueError(
                 f"All t_new values must be between t_min ({t_min}) and t_max ({t_max})."
             )
 
-        # Ensure arrays are proper ndarrays for CuPy compatibility
-        t_old_arr = np.asarray(t_old)
-        t_new_arr = np.asarray(t_new)
-        segments = np.searchsorted(t_old_arr, t_new_arr, side="right") - 1
-        segments[t_new_arr == t_max] = t_old_arr.shape[0] - 2
+        segments = xp_local.searchsorted(t_old, t_new, side="right") - 1
+        segments[t_new == t_max] = t_old.shape[0] - 2
 
         tmp_coeffs = spline_coeffs[segments]
-        tmp_t_old = t_old_arr[segments]
-        diffs = np.diff(t_old_arr)[segments]
+        tmp_t_old = t_old[segments]
+        diffs = xp_local.diff(t_old)[segments]
 
         assert spline_coeffs.ndim == 3 and spline_coeffs.shape[-1] == 8
 
@@ -884,7 +909,7 @@ class DOPR853:
         rcont7 = tmp_coeffs[:, :, 6]
         rcont8 = tmp_coeffs[:, :, 7]
 
-        s = ((t_new_arr - tmp_t_old) / diffs)[:, None]  # add axes to match rcont shape
+        s = ((t_new - tmp_t_old) / diffs)[:, None]  # add axes to match rcont shape
         s2 = s**2
         s3 = s**3
         s4 = s**4
