@@ -318,7 +318,7 @@ class ModeSelector(ParallelModuleBase):
         if mode_selection == "all":
             # get teuk modes
             teuk_modes = self.amplitude_generator(a, p, e, xI)
-            
+
             # get ylms
             ylms = self.ylm_generator(self.unique_l, self.unique_m, theta, phi)[self.inverse_lm]
 
@@ -331,6 +331,10 @@ class ModeSelector(ParallelModuleBase):
             ylmkeep = self.xp.concatenate([keep_modes, temp2])
             ylms_out = ylms[ylmkeep]
             teuk_modes_out = teuk_modes
+
+            # No SNR sorting for "all" modes
+            self.kept_mode_snrs = None
+            self.snr_sort_order = None
 
             out_tuple = (
                 teuk_modes_out,
@@ -353,15 +357,19 @@ class ModeSelector(ParallelModuleBase):
 
             # get ylms, only for the desired modes (needs to include -m modes in general, so we pass the kwarg)
             ylms_out = self.ylm_generator(mode_arr[:, 0], mode_arr[:,1], theta, phi, include_minus_m=True)
-            
+
             # if include_minus_mkn is False, we need to zero out the latter half of this array
             if not include_minus_mkn:
                 # zero out the -m modes
                 # ylms[keep_modes >= self.num_m_zero_up] = 0.0 + 0.0j
                 ylms_out[teuk_modes.shape[1]:] = 0.0 + 0.0j
 
+            # No SNR sorting for list mode selection
+            self.kept_mode_snrs = None
+            self.snr_sort_order = None
+
             out_tuple = (
-                teuk_modes, 
+                teuk_modes,
                 ylms_out,
                 mode_arr[:,0],
                 mode_arr[:,1],
@@ -440,6 +448,14 @@ class ModeSelector(ParallelModuleBase):
             keep_modes, indices, inv_inds, counts = self.xp.unique(
                 keep_modes_temp, return_index=True, return_counts=True, return_inverse=True,
             )
+
+            # Store SNR values for kept modes (for external tracking of dominant modes)
+            # mode_snr2_ests is sorted by SNR (descending) after line 427
+            # inds_keep marks which positions in that sorted array we're keeping
+            # indices maps from unique-sorted positions back to SNR-sorted positions
+            self.kept_mode_snrs = mode_snr2_ests[inds_keep][indices]
+            # Create sort order by SNR (highest first)
+            self.snr_sort_order = self.xp.argsort(self.kept_mode_snrs)[::-1]
 
             # find minus mkn modes that need to be removed
             if include_minus_mkn:  # if true then we do not want to exclude any modes
