@@ -368,13 +368,14 @@ class ModeSelector(ParallelModuleBase):
             self.kept_mode_snrs = None
             self.snr_sort_order = None
 
+            # Copy mode_arr slices to avoid GPU memory issues with repeated calls
             out_tuple = (
                 teuk_modes,
                 ylms_out,
-                mode_arr[:,0],
-                mode_arr[:,1],
-                mode_arr[:,2],
-                mode_arr[:,3],
+                mode_arr[:,0].copy(),
+                mode_arr[:,1].copy(),
+                mode_arr[:,2].copy(),
+                mode_arr[:,3].copy(),
             )     
 
         else:
