@@ -127,6 +127,7 @@ class SphericalHarmonicWaveformBase(
         dt: float = 10.0,
         T: float = 1.0,
         mode_selection_threshold: float = 1e-5,
+        snr_abs_thr: Optional[float] = None,
         show_progress: bool = False,
         batch_size: int = -1,
         mode_selection: Optional[Union[str, list, np.ndarray]] = None,
@@ -299,14 +300,7 @@ class SphericalHarmonicWaveformBase(
                 online_mode_selection_args = None
 
             # get amplitudes that have been selected / sorted to user requirements
-            (
-                teuk_modes_in,
-                ylms_in,
-                self.ls,
-                self.ms,
-                self.ks,
-                self.ns,
-            ) = self.mode_selector(
+            mode_selector_result = self.mode_selector(
                 t_temp,
                 a,
                 p_temp,
@@ -318,7 +312,28 @@ class SphericalHarmonicWaveformBase(
                 mode_selection=mode_selection,
                 include_minus_mkn=include_minus_mkn,
                 mode_selection_threshold=mode_selection_threshold,
+                snr_abs_thr=snr_abs_thr,
             )
+            
+            # Unpack base results
+            (
+                teuk_modes_in,
+                ylms_in,
+                self.ls,
+                self.ms,
+                self.ks,
+                self.ns,
+            ) = mode_selector_result[:6]
+            
+            # Store snr_top and snr_ratio if available (when snr_abs_thr is used)
+            if snr_abs_thr is not None and len(mode_selector_result) >= 8:
+                self.snr_top = mode_selector_result[6]
+                self.snr_ratio = mode_selector_result[7]
+            else:
+                # Get from mode_selector attributes (for threshold mode)
+                self.snr_top = getattr(self.mode_selector, 'snr_top', None)
+                self.snr_ratio = getattr(self.mode_selector, 'snr_ratio', None)
+            
             # store number of modes for external information
             self.num_modes_kept = teuk_modes_in.shape[1]
 

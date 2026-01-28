@@ -264,7 +264,8 @@ class ModeSelector(ParallelModuleBase):
         mode_selection: Optional[Union[str, list, np.ndarray]] = None,
         include_minus_mkn: Optional[bool] = None,
         mode_selection_threshold: float = None,
-        return_sort_inds: bool = False
+        return_sort_inds: bool = False,
+        snr_abs_thr: Optional[float] = None
     ) -> tuple[np.ndarray]:
         r"""Call to sort and filer teukolsky modes.
 
@@ -308,6 +309,9 @@ class ModeSelector(ParallelModuleBase):
                 1e-5.
             return_sort_inds: If True, also return the indices sorting the modes according
                 to their contribution. Only used when filtering in this mode. Default is False.
+            snr_abs_thr: SNR ratio threshold for mode selection. If provided, keeps only the 
+                dominant mode when SNR_top/SNR_second > snr_abs_thr. Overrides mode_selection_threshold.
+                Use with caution. Default is None.
             
         """
 
@@ -432,10 +436,20 @@ class ModeSelector(ParallelModuleBase):
             # initialize and indices array for keeping modes
             inds_keep = self.xp.full(cumsum.shape, True)
 
-            # keep modes that add to within the fractional square SNR (1 - kappa)^2
-            inds_keep[1:] = cumsum[:-1] < cumsum[-1] * (
-                1 - mode_selection_threshold
-            )**2
+            # Store snr_ratio and snr_top for external access
+            self.snr_top = self.xp.sqrt(mode_snr2_ests[0]) if len(mode_snr2_ests) > 0 else 0.0
+            self.snr_ratio = self.xp.sqrt(mode_snr2_ests[0]/mode_snr2_ests[1]) if len(mode_snr2_ests) > 1 else float('inf')
+
+            if snr_abs_thr is not None:
+                # keep only dominant mode if SNR ratio exceeds threshold
+                biggap = self.snr_ratio > snr_abs_thr
+                inds_keep = self.xp.zeros(len(mode_snr2_ests)) != 0
+                inds_keep[0] = biggap
+            else:
+                # keep modes that add to within the fractional square SNR (1 - kappa)^2
+                inds_keep[1:] = cumsum[:-1] < cumsum[-1] * (
+                    1 - mode_selection_threshold
+                )**2
 
             # finds indices of each mode to be kept
             keep_modes_temp = inds_sort[inds_keep]
@@ -507,6 +521,9 @@ class ModeSelector(ParallelModuleBase):
         
             if return_sort_inds:
                 out_tuple += (inv_inds,)
+            
+            if snr_abs_thr is not None:
+                out_tuple += (self.snr_top, self.snr_ratio,)
 
         return out_tuple
 
