@@ -193,7 +193,8 @@ class ModeSelector(ParallelModuleBase):
         # If mode_selection is None, default to values specified at instantiation
         if mode_selection is None:
             mode_selection = self.mode_selection
-            mode_arr = self.mode_arr
+            # Copy mode_arr to avoid GPU memory issues with repeated calls
+            mode_arr = self.mode_arr.copy() if self.mode_arr is not None else None
             if self.negative_m_flag and include_minus_mkn:
                 raise ValueError(
                     "Only supports mode_selection with m >= 0 when include_minus_mkn = True."
